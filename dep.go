@@ -4,13 +4,15 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"log"
+	"io/ioutil"
 	"net/http"
 	"os"
-	"os/user"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/mholt/archiver"
+	"github.com/spf13/viper"
 
 	"gopkg.in/alecthomas/kingpin.v2"
 )
@@ -24,36 +26,24 @@ func main() {
 	kingpin.Version("0.0.1")
 	kingpin.Parse()
 
-	usr, e := user.Current()
-	if e != nil {
-		log.Fatal(e)
-	}
-
-	// try to get .deprc file where the server location is specified
-	deprc := usr.HomeDir + "/.deprc"
-	if _, e := os.Stat(deprc); os.IsNotExist(e) {
-		deprc = ".deprc"
-	}
-	if _, e := os.Stat(deprc); os.IsNotExist(e) {
-		log.Fatal("Please create a .deprc file with all available dependency sources\n (one dependency source per line, i.e. a URL or a directory).")
-	}
-
-	sources := make([]string, 0)
-	f, e := os.OpenFile(deprc, os.O_RDONLY, 0755)
-	defer f.Close()
-	r := bufio.NewReader(f)
-	s, e := Readln(r)
-	for e == nil {
-		sources = append(sources, s)
-		s, e = Readln(r)
+	viper.SetDefault("SevenZipExecutable", "C:/Program Files/7-Zip/7z.exe")
+	viper.SetDefault("DependencyDirectory", "dep")
+	viper.SetDefault("Repositories", []string{})
+	viper.SetConfigName("config")       // name of config file (without extension)
+	viper.AddConfigPath("$HOME/.deprc") // call multiple times to add many search paths
+	viper.AddConfigPath(".")            // optionally look for config in the working directory
+	viper.AutomaticEnv()
+	err := viper.ReadInConfig() // Find and read the config file
+	if err != nil {             // Handle errors reading the config file
+		panic(fmt.Errorf("Fatal error config file: %s", err))
 	}
 
 	// now gather all required dependencies
 	dependencies := make(map[string]string)
-	f, e = os.OpenFile(*depfile, os.O_RDWR, 0755)
+	f, e := os.OpenFile(*depfile, os.O_RDWR, 0755)
 	defer f.Close()
-	r = bufio.NewReader(f)
-	s, e = Readln(r)
+	r := bufio.NewReader(f)
+	s, e := Readln(r)
 	for e == nil {
 		if !strings.HasPrefix(s, "#") {
 			kv := strings.Split(s, " ")
@@ -64,32 +54,119 @@ func main() {
 		s, e = Readln(r)
 	}
 
+	err = os.RemoveAll(viper.GetString("DependencyDirectory"))
+	if err != nil {
+		panic(err)
+	}
+	err = os.Mkdir(viper.GetString("DependencyDirectory"), 0755)
+	if err != nil {
+		panic(err)
+	}
+
 	// try to download the dependencies
 	for dep, ver := range dependencies {
 		e = nil
-		for _, source := range sources {
-			if _, e = Download(dep, ver, source); e == nil {
+		for _, source := range viper.GetStringSlice("Repositories") {
+			if _, e = Download(dep, ver, source, ".zip"); e == nil {
+				fmt.Print("Resolved " + dep + " " + ver + "\n")
+				break
+			} else if _, e = Download(dep, ver, source, ".7z"); e == nil {
+				fmt.Print("Resolved " + dep + " " + ver + "\n")
+				break
+			} else if _, e = CopyFromDisk(dep, ver, source); e == nil {
 				fmt.Print("Resolved " + dep + " " + ver + "\n")
 				break
 			}
 		}
 		if e != nil {
-			fmt.Printf("Error while trying to download %s: %s\n", dep, e)
+			fmt.Printf("Error while trying to download %s %s: %s\n", dep, ver, e)
 		}
 	}
 }
 
+// CopyFromDisk tries to copy the dependency dep in version ver from folder dir
+func CopyFromDisk(dep string, ver string, dir string) (string, error) {
+	path := dir + "/" + dep + "-" + ver + ".*"
+	files, _ := filepath.Glob(path)
+
+	if len(files) == 0 {
+		return path, fmt.Errorf("CopyFromDisk: dependency could not be found")
+	}
+	path = files[0]
+
+	if strings.HasSuffix(path, ".zip") || strings.HasSuffix(path, ".7z") {
+		file, err := ioutil.TempFile(".", "temp_")
+		if err != nil {
+			return path, err
+		}
+		defer os.Remove(file.Name())
+		defer file.Close()
+
+		err = CopyFile(path, file)
+		if err != nil {
+			return path, err
+		}
+
+		dest := viper.GetString("DependencyDirectory") + "/" + dep
+		if strings.HasSuffix(path, ".zip") {
+			err = archiver.Zip.Open(file.Name(), dest)
+			if err != nil {
+				return path, err
+			}
+		} else {
+			file.Close()
+			cmd := exec.Command("7z", "e", file.Name(), "-o"+dest, "-r", "-t7z", "-aoa")
+			_, err := cmd.CombinedOutput()
+			if err != nil {
+				return path, err
+			}
+		}
+	} else {
+		file, err := os.Create(viper.GetString("DependencyDirectory") + "/" + dep + filepath.Ext(path))
+		if err != nil {
+			return path, err
+		}
+		defer file.Close()
+
+		err = CopyFile(path, file)
+		if err != nil {
+			return path, err
+		}
+	}
+
+	return path, nil
+}
+
+// CopyFile copies the contents of the file named src to the file named
+// by dst. The file will be created if it does not already exist. If the
+// destination file exists, all it's contents will be replaced by the contents
+// of the source file.
+func CopyFile(src string, out *os.File) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return
+	}
+	defer in.Close()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return
+	}
+	err = out.Sync()
+	return
+}
+
 // Download tries to download the dependency dep in version ver from URL url.
-func Download(dep string, ver string, url string) (string, error) {
-	url = url + "/" + dep + "-" + ver + ".zip"
+func Download(dep string, ver string, url string, ext string) (string, error) {
+	url = url + "/" + dep + "-" + ver + ext
 
 	// Create the file
-	out, err := os.Create("temp.zip")
+	// out, err := os.Create("temp" + ext)
+	file, err := ioutil.TempFile(".", "temp_")
 	if err != nil {
 		return url, err
 	}
-	defer out.Close()
-	defer os.Remove("temp.zip")
+	defer os.Remove(file.Name())
+	defer file.Close()
 
 	// Get the data
 	resp, err := http.Get(url)
@@ -98,27 +175,40 @@ func Download(dep string, ver string, url string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	// Writer the body to file
-	_, err = io.Copy(out, resp.Body)
+	if resp.StatusCode != 200 {
+		return url, fmt.Errorf("Download: The file could not be downloaded")
+	}
+
+	// Write the body to file
+	_, err = io.Copy(file, resp.Body)
 	if err != nil {
 		return url, err
 	}
 
 	// Unarchive
-	dir := "dep/" + dep
-	err = os.RemoveAll(dir)
-	if err != nil {
-		return url, err
-	}
+	dir := viper.GetString("DependencyDirectory") + "/" + dep
+	// err = os.Remove(dir)
+	// if err != nil {
+	// 	return url, err
+	// }
 
 	err = os.MkdirAll(dir, 0755)
 	if err != nil {
 		return url, err
 	}
 
-	err = archiver.Zip.Open("temp.zip", dir)
-	if err != nil {
-		return url, err
+	if ext == ".zip" {
+		err = archiver.Zip.Open(file.Name(), dir)
+		if err != nil {
+			return url, err
+		}
+	} else if ext == ".7z" {
+		file.Close()
+		cmd := exec.Command("7z", "e", file.Name(), "-o"+dir, "-r", "-t7z", "-aoa")
+		_, err := cmd.CombinedOutput()
+		if err != nil {
+			return url, err
+		}
 	}
 
 	return url, nil
